@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -13,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
+var cmdPath = "./cmd"
+
 func main() {
 	svc := ec2.New(session.New(), &aws.Config{Region: aws.String("us-west-2")})
 
@@ -20,26 +24,49 @@ func main() {
 	inst, err := findRunningInstance(svc)
 	if err != nil {
 		// No running instance exists, create one
-		rsv, err := createInstance(svc)
+		fmt.Println("No instance found, creating...")
+		inst, err = createInstance(svc)
 		check(err)
+		fmt.Println("Created new instance")
 
-		inst = rsv.Instances[0]
-		fmt.Printf("Created new instance\n")
+		params := &ec2.DescribeInstancesInput{
+			Filters: []*ec2.Filter{
+				&ec2.Filter{
+					Name:   aws.String("instance-id"),
+					Values: []*string{inst.InstanceId},
+				},
+			},
+		}
 
 		// Wait until the instance is up and running
-		waitForInstanceToRun(svc, inst.InstanceId)
+		fmt.Println("Waiting for instance to be ready...")
+		svc.WaitUntilInstanceRunning(params)
+		fmt.Println("Instance ready")
 
-		fmt.Printf("Instance is up and running\n")
+		res, err := svc.DescribeInstances(params)
+		check(err)
+		inst = res.Reservations[0].Instances[0]
+
 	} else {
 		fmt.Printf("Running instance found\n")
 	}
 
-	fmt.Printf("Using instance '%s'\n", *inst.InstanceId)
+	fmt.Printf("Using instance '%s'\n", *inst.PublicIpAddress)
 
-	// Execute command
-	res, err := execCmd(inst, "whoami")
+	// Execute commands
+	file, err := os.Open(cmdPath)
 	check(err)
-	fmt.Printf("Whoami: %s", *res)
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		cmd := scanner.Text()
+		res, err := execCmd(inst, cmd)
+		check(err)
+		fmt.Printf("\n> %s\n%s", cmd, *res)
+	}
+	err = scanner.Err()
+	check(err)
 }
 
 func check(err error) {
@@ -48,15 +75,17 @@ func check(err error) {
 	}
 }
 
-func createInstance(svc *ec2.EC2) (*ec2.Reservation, error) {
+func createInstance(svc *ec2.EC2) (*ec2.Instance, error) {
 	params := &ec2.RunInstancesInput{
-		ImageId:      aws.String("ami-d732f0b7"), // Ubuntu
-		InstanceType: aws.String("t2.micro"),
-		MaxCount:     aws.Int64(1),
-		MinCount:     aws.Int64(1),
-		KeyName:      aws.String("cc_assignment0"),
+		ImageId:          aws.String("ami-d732f0b7"), // Ubuntu
+		InstanceType:     aws.String("t2.micro"),
+		MaxCount:         aws.Int64(1),
+		MinCount:         aws.Int64(1),
+		KeyName:          aws.String("cc_assignment0"),
+		SecurityGroupIds: []*string{aws.String("sg-e26fb89b")},
 	}
-	return svc.RunInstances(params)
+	res, err := svc.RunInstances(params)
+	return res.Instances[0], err
 }
 
 func findRunningInstance(svc *ec2.EC2) (*ec2.Instance, error) {
@@ -76,19 +105,6 @@ func findRunningInstance(svc *ec2.EC2) (*ec2.Instance, error) {
 	return nil, fmt.Errorf("Could not find running instance.")
 }
 
-func waitForInstanceToRun(svc *ec2.EC2, id *string) error {
-	params := &ec2.DescribeInstancesInput{
-		Filters: []*ec2.Filter{
-			&ec2.Filter{
-				Name:   aws.String("instance-id"),
-				Values: []*string{id},
-			},
-		},
-	}
-
-	return svc.WaitUntilInstanceRunning(params)
-}
-
 func execCmd(inst *ec2.Instance, cmd string) (*string, error) {
 	// Open PEM file
 	pemPath := os.Getenv("PEM_PATH")
@@ -105,13 +121,24 @@ func execCmd(inst *ec2.Instance, cmd string) (*string, error) {
 
 	// Connect to the remote server and perform the SSH handshake
 	config := &ssh.ClientConfig{
-		User: "ubuntu",
-		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		User:    "ubuntu",
+		Auth:    []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		Timeout: 5 * time.Second,
 	}
+	fmt.Printf("Executing command: %s\n", cmd)
 	addr := fmt.Sprintf("%s:%d", *inst.PublicIpAddress, 22)
-	conn, err := ssh.Dial("tcp", addr, config)
-	if err != nil {
-		return nil, err
+
+	// Retry SSH until successful
+	var conn *ssh.Client
+	try, max, interval := 1, 5, 10*time.Second
+	for conn == nil && try <= max {
+		conn, err = ssh.Dial("tcp", addr, config)
+		if err != nil {
+			// Timeout occurred
+			fmt.Printf("%v (%d/%d), trying again in %v...\n", err, try, max, interval)
+			time.Sleep(interval)
+		}
+		try++
 	}
 	defer conn.Close()
 
@@ -124,7 +151,9 @@ func execCmd(inst *ec2.Instance, cmd string) (*string, error) {
 	var stdoutBuf bytes.Buffer
 	session.Stdout = &stdoutBuf
 	err = session.Run(cmd)
-	check(err)
+	if err != nil {
+		return nil, err
+	}
 
 	return aws.String(stdoutBuf.String()), nil
 }
