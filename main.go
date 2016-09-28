@@ -18,13 +18,13 @@ import (
 var cmdPath = "./cmd"
 
 func main() {
-	svc := ec2.New(session.New(), &aws.Config{Region: aws.String("us-west-2")})
+	svc := ec2.New(session.New(), &aws.Config{Region: aws.String(os.Getenv("REGION"))})
 
 	// Find a running instance to use
 	inst, err := findRunningInstance(svc)
 	if err != nil {
 		// No running instance exists, create one
-		fmt.Println("No instance found, creating...")
+		fmt.Println("No instance found, creating:")
 		inst, err = createInstance(svc)
 		check(err)
 		fmt.Println("Created new instance")
@@ -77,15 +77,19 @@ func check(err error) {
 
 func createInstance(svc *ec2.EC2) (*ec2.Instance, error) {
 	params := &ec2.RunInstancesInput{
-		ImageId:          aws.String("ami-d732f0b7"), // Ubuntu
-		InstanceType:     aws.String("t2.micro"),
+		ImageId:          aws.String(os.Getenv("IMG_ID")), // Ubuntu
+		InstanceType:     aws.String(os.Getenv("INST_TYPE")),
 		MaxCount:         aws.Int64(1),
 		MinCount:         aws.Int64(1),
-		KeyName:          aws.String("cc_assignment0"),
-		SecurityGroupIds: []*string{aws.String("sg-e26fb89b")},
+		KeyName:          aws.String(os.Getenv("PEM_NAME")),
+		SecurityGroupIds: []*string{aws.String(os.Getenv("SEC_GROUP"))},
 	}
+	fmt.Printf("\n%#v", params)
 	res, err := svc.RunInstances(params)
-	return res.Instances[0], err
+	if err != nil {
+		return nil, err
+	}
+	return res.Instances[0], nil
 }
 
 func findRunningInstance(svc *ec2.EC2) (*ec2.Instance, error) {
